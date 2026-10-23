@@ -1,14 +1,14 @@
 window.storyFormat({
-    "name": "Harlowe 3 to JSON (BLINDSTACK)",
+    "name": "Harlowe 3 to JSON (blindstack)",
     "version": "0.0.6",
-    "author": "dionysus",
+    "author": "Jonathan Schoonhoven",
     "description": "Convert Harlowe 3-formatted Twine story to JSON",
     "proofing": false,
     "source": `
 <html>
 	<head>
         <meta http-equiv='Content-Type' content='text/html; charset=UTF-8' />
-		<title>Harlowe To JSON</title>
+		<title>Harlowe To JSON (BLINDSTACK)</title>
         <script type='text/javascript'>
             /**
  * Twine To JSON
@@ -77,12 +77,16 @@ function validate(format) {
 function processPassageElement(passageElement, format) {
   const passageMeta = getElementAttributes(passageElement);
   const result = {
-    name: passageMeta.name,
-    tags: passageMeta.tags,
-    id: passageMeta.pid,
+    id: passageMeta.name,
+    // tags: passageMeta.tags,
+    pid: passageMeta.pid,
   };
-  result.speaker = extractPassageSpeaker(passageMeta.tags)
-  result.text = passageElement.innerText.trim();
+  result.meta = parseMetaTags(passageMeta.tags);
+
+  const rawContent = passageElement.textContent || passageElement.innerText || "";
+  result.text = rawContent.trim();
+  // result.text = passageElement.innerText.trim();
+
   Object.assign(result, processPassageText(result.text, format));
   result.cleanText = sanitizeText(
     result.text,
@@ -101,63 +105,86 @@ function processPassageText(passageText, format) {
     result.hooks = [];
   }
   let currentIndex = 0;
+
+  
   while (currentIndex < passageText.length) {
     const maybeLink = extractLinksAtIndex(passageText, currentIndex);
     if (maybeLink) {
       result.links.push(maybeLink);
       currentIndex += maybeLink.original.length;
+      continue; // Jump to next token immediately without adding +1
     }
+
     if (format !== FORMAT_HARLOWE_3) {
       currentIndex += 1;
       continue;
     }
+
     const maybeLeftHook = extractLeftHooksAtIndex(passageText, currentIndex);
     if (maybeLeftHook) {
       result.hooks.push(maybeLeftHook);
       currentIndex += maybeLeftHook.original.length;
+      continue;
     }
-    currentIndex += 1;
+
     const maybeHook = extractHooksAtIndex(passageText, currentIndex);
     if (maybeHook) {
       result.hooks.push(maybeHook);
       currentIndex += maybeHook.original.length;
+      continue;
     }
+
+    // Advance by one only if no tokens matched
+    currentIndex += 1;
+  
   }
+
+
   return result;
 }
+
 
 function extractLinksAtIndex(passageText, currentIndex) {
   const currentChar = passageText[currentIndex];
   const nextChar = passageText[currentIndex + 1];
+
   if (currentChar === "[" && nextChar === "[") {
     const link = getSubstringBetweenBrackets(passageText, currentIndex + 1);
     const leftSplit = link.split("<-", 2);
     const rightSplit = link.split("->", 2);
-    const original = passageText.substring(
-      currentIndex,
-      currentIndex + link.length + 4,
-    );
+    
+    const linkEndIndex = currentIndex + link.length + 4; // After "]]"
+
+    // Look ahead for trailing <!--showif:...--> and <!--action:...-->
+    const directives = parseTrailingDirectives(passageText, linkEndIndex);
+    
+    // original covers both the link and its trailing comments
+    const original = passageText.substring(currentIndex, directives.endIndex);
+
+    let text = "";
+    let targetId = "";
+
     if (leftSplit.length === 2) {
-      return {
-        linkText: leftSplit[1].trim(),
-        passageName: leftSplit[0].trim(),
-        original: original,
-      };
+      text = leftSplit[1].trim();
+      targetId = leftSplit[0].trim();
     } else if (rightSplit.length === 2) {
-      return {
-        linkText: rightSplit[0].trim(),
-        passageName: rightSplit[1].trim(),
-        original: original,
-      };
+      text = rightSplit[0].trim();
+      targetId = rightSplit[1].trim();
     } else {
-      return {
-        linkText: link.trim(),
-        passageName: link.trim(),
-        original: original,
-      };
+      text = link.trim();
+      targetId = link.trim();
     }
+
+    return {
+      text: text,
+      target_id: targetId,
+      show_if: directives.show_if,
+      actions: directives.actions,
+      original: original
+    };
   }
 }
+
 
 function extractLeftHooksAtIndex(passageText, currentIndex) {
   const regexAlphaNum = /[a-z0-9]+/i;
@@ -189,13 +216,27 @@ function extractLeftHooksAtIndex(passageText, currentIndex) {
   }
 }
 
+const tagKeys = ["speaker", "emotion"]
+const speaker_prefix = "speaker:"
+const delimiter = ":"
+const default_meta = {
+  speaker: "",
+  emotion: ""
+}
 
-function extractPassageSpeaker(passageMeta) {
-  for (tag in passageMeta.tags){
-    if (stringStartsWith(tag, "speaker:")) {
-      return trimPrefix(passageMeta, "speaker:")
-    }
+// parses "ABC:XYZ" tags if valid 
+function parseMetaTags(tags) {
+  if (!tags || typeof tags !== "string") {
+    return {};
   }
+  const raw_tags = tags.trim().split(/\\s+/);
+  let metadata = {};
+  for (const tag of raw_tags) {
+    if (!tag.includes(delimiter)) continue;
+    let [key, value] = tag.split(delimiter, 2);
+    metadata[key] = value;
+  }
+  return metadata;
 }
 
 
@@ -312,6 +353,63 @@ function getSubstringBetweenBrackets(
   return substring;
 }
 
+
+
+function parseTrailingDirectives(passageText, startIndex) {
+  // Matches a single <!--showif: ...--> or <!--action: ...--> block per iteration
+  // Using --!?> guarantees consuming both standard '-->' and typo '--!>'
+  const directiveRegex = /^\\s*<!--(showif|action):\\s*([\\s\\S]*?)--!?>/i;
+
+  const show_if = [];
+  const actions = [];
+  let currentIndex = startIndex;
+
+  // Loop through consecutive directive comments
+  while (currentIndex < passageText.length) {
+    const remainingText = passageText.substring(currentIndex);
+    const match = remainingText.match(directiveRegex);
+    if (!match) break; // Stop as soon as no more directives follow
+
+    const directiveType = match[1].toLowerCase();
+    const payload = match[2].trim();
+
+    // Supports both single-entry lines and comma-separated entries
+    const items = payload.split(",").map(s => s.trim()).filter(Boolean);
+    for (const item of items) {
+      if (!item.includes(":")) continue;
+
+      let trimmed = item;
+      let inverse = false;
+      if (trimmed.startsWith("!")) {
+        inverse = true;
+        trimmed = trimmed.substring(1);
+      }
+
+      const [type, value] = trimmed.split(":", 2);
+      if (directiveType === "showif") {
+        show_if.push({
+          type: type.trim(),
+          value: value ? value.trim() : "",
+          inverse: inverse
+        });
+      } else if (directiveType === "action") {
+        actions.push({
+          type: type.trim(),
+          value: value ? value.trim() : ""
+        });
+      }
+    }
+
+    // Advance index past this entire comment block
+    currentIndex += match[0].length;
+  }
+
+  return {
+    show_if,
+    actions,
+    endIndex: currentIndex
+  };
+}
         </script>
 	</head>
 	<body>
