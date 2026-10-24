@@ -1,14 +1,14 @@
 window.storyFormat({
-    "name": "Harlowe 3 to JSON (blindstack)",
-    "version": "0.0.6",
-    "author": "Jonathan Schoonhoven",
+    "name": "BLINDSTACK JSON",
+    "version": "0.0.1",
+    "author": "dionysus",
     "description": "Convert Harlowe 3-formatted Twine story to JSON",
     "proofing": false,
     "source": `
 <html>
 	<head>
         <meta http-equiv='Content-Type' content='text/html; charset=UTF-8' />
-		<title>Harlowe To JSON (BLINDSTACK)</title>
+		<title>BLINDSTACK</title>
         <script type='text/javascript'>
             /**
  * Twine To JSON
