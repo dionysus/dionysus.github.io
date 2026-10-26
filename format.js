@@ -37,9 +37,33 @@ const FORMAT_TWINE = "twine";
 const FORMAT_HARLOWE_3 = "harlowe-3";
 const VALID_FORMATS = [FORMAT_TWINE, FORMAT_HARLOWE_3];
 
+const tagKeys = ["speaker", "emotion"];
+const speaker_prefix = "speaker:";
+const delimiter = ":";
+const default_meta = {
+  speaker: "",
+  emotion: "",
+};
 
+/**
+ * Resolves the root story name from the DOM safely to avoid parameter drilling.
+ */
+function getStoryConvoId() {
+  const storyElement = document.getElementsByTagName(STORY_TAG_NAME)[0];
+  return (storyElement ? storyElement.getAttribute("name") || "default" : "default")
+    .toLowerCase()
+    .trim();
+}
 
-
+/**
+ * Normalizes shorthand IDs into canonical "convoId.key" composite IDs.
+ */
+function canonicalizeKey(key) {
+  if (!key) return "";
+  const trimmed = key.trim();
+  const convoId = getStoryConvoId();
+  return trimmed.includes(".") ? trimmed : convoId + "." + trimmed;
+}
 
 /**
  * Convert Twine story to JSON.
@@ -56,19 +80,22 @@ function twineToJSON(format) {
     schemaVersion: storyMeta["format-version"],
     createdAtMs: Date.now(),
   };
+
   validate(format);
+
   const passageElements = Array.from(
     storyElement.getElementsByTagName(PASSAGE_TAG_NAME),
   );
-  const convoId = (storyMeta.name || "default").toLowerCase().trim();
+
   result.passages = passageElements.map((passageElement) => {
-    return processPassageElement(passageElement, format, convoId);
+    return processPassageElement(passageElement, format);
   });
+
   return result;
 }
 
 /**
- * Validate story and inputs. Currently this only validates the format arg. TODO: make this more robust.
+ * Validate story and inputs.
  */
 function validate(format) {
   const isValidFormat = VALID_FORMATS.some(
@@ -81,30 +108,30 @@ function validate(format) {
 
 function processPassageElement(passageElement, format) {
   const passageMeta = getElementAttributes(passageElement);
-  const rawName = passageMeta.name.trim();
+  const passageName = (passageMeta.name || "").trim();
 
   const result = {
-    id: rawName,
-    convo_key: `${convoId}.${rawName}`, // <-- Pre-baked passage composite key
+    id: passageName,
+    convo_key: canonicalizeKey(passageName),
     pid: passageMeta.pid,
   };
 
   result.meta = parseMetaTags(passageMeta.tags);
+
+  // textContent safely reads nodes even if <tw-storydata> is hidden in the DOM
   const rawContent = passageElement.textContent || passageElement.innerText || "";
   result.text = rawContent.trim();
 
-  // Pass convoId into processPassageText
-  Object.assign(result, processPassageText(result.text, format, convoId));
+  Object.assign(result, processPassageText(result.text, format));
   result.cleanText = sanitizeText(
     result.text,
     result.links,
     result.hooks,
     format,
   );
+
   return result;
 }
-
-
 
 function processPassageText(passageText, format) {
   const result = { links: [] };
@@ -113,13 +140,12 @@ function processPassageText(passageText, format) {
   }
   let currentIndex = 0;
 
-  
   while (currentIndex < passageText.length) {
     const maybeLink = extractLinksAtIndex(passageText, currentIndex);
     if (maybeLink) {
       result.links.push(maybeLink);
       currentIndex += maybeLink.original.length;
-      continue; // Jump to next token immediately without adding +1
+      continue; // Jump to end of link token without adding +1
     }
 
     if (format !== FORMAT_HARLOWE_3) {
@@ -141,15 +167,11 @@ function processPassageText(passageText, format) {
       continue;
     }
 
-    // Advance by one only if no tokens matched
     currentIndex += 1;
-  
   }
-
 
   return result;
 }
-
 
 function extractLinksAtIndex(passageText, currentIndex) {
   const currentChar = passageText[currentIndex];
@@ -159,13 +181,13 @@ function extractLinksAtIndex(passageText, currentIndex) {
     const link = getSubstringBetweenBrackets(passageText, currentIndex + 1);
     const leftSplit = link.split("<-", 2);
     const rightSplit = link.split("->", 2);
-    
+
     const linkEndIndex = currentIndex + link.length + 4; // After "]]"
 
-    // Look ahead for trailing <!--showif:...--> and <!--action:...-->
+    // Parse trailing directive comments (showif, action)
     const directives = parseTrailingDirectives(passageText, linkEndIndex);
-    
-    // original covers both the link and its trailing comments
+
+    // original covers both the link and all trailing directive comments
     const original = passageText.substring(currentIndex, directives.endIndex);
 
     let text = "";
@@ -184,14 +206,75 @@ function extractLinksAtIndex(passageText, currentIndex) {
 
     return {
       text: text,
-      target_id: canonicalizeKey(convoId, targetId),
+      target_id: canonicalizeKey(targetId),
       show_if: directives.show_if,
       actions: directives.actions,
-      original: original
+      original: original,
     };
   }
 }
 
+function parseTrailingDirectives(passageText, startIndex) {
+  // Matches <!--showif: ...--> or <!--action: ...--> (handles both --> and --!>)
+  const directiveRegex = /^\\s*<!--(showif|action):\\s*([\\s\\S]*?)--!?>/i;
+
+  const show_if = [];
+  const actions = [];
+  let currentIndex = startIndex;
+
+  while (currentIndex < passageText.length) {
+    const remainingText = passageText.substring(currentIndex);
+    const match = remainingText.match(directiveRegex);
+    if (!match) break;
+
+    const directiveType = match[1].toLowerCase();
+    const payload = match[2].trim();
+
+    // Supports single entries or comma-separated lists
+    const items = payload.split(",").map((s) => s.trim()).filter(Boolean);
+
+    for (const item of items) {
+      if (!item.includes(":")) continue;
+
+      let trimmed = item;
+      let inverse = false;
+      if (trimmed.startsWith("!")) {
+        inverse = true;
+        trimmed = trimmed.substring(1);
+      }
+
+      const [type, value] = trimmed.split(":", 2);
+      if (directiveType === "showif") {
+        let finalValue = value ? value.trim() : "";
+
+        // Canonicalize local dialogue references into "convoId.passageId"
+        const isDialogueCheck = type.toLowerCase().includes("dialog");
+        if (isDialogueCheck) {
+          finalValue = canonicalizeKey(finalValue);
+        }
+
+        show_if.push({
+          type: type.trim(),
+          value: finalValue,
+          inverse: inverse,
+        });
+      } else if (directiveType === "action") {
+        actions.push({
+          type: type.trim(),
+          value: value ? value.trim() : "",
+        });
+      }
+    }
+
+    currentIndex += match[0].length;
+  }
+
+  return {
+    show_if: show_if,
+    actions: actions,
+    endIndex: currentIndex,
+  };
+}
 
 function extractLeftHooksAtIndex(passageText, currentIndex) {
   const regexAlphaNum = /[a-z0-9]+/i;
@@ -204,7 +287,7 @@ function extractLeftHooksAtIndex(passageText, currentIndex) {
       ">",
     );
     if (maybeHookName.match(regexAlphaNum)) {
-      const hookStartIndex = currentIndex + maybeHookName.length + 2; // advance to next char after ">"
+      const hookStartIndex = currentIndex + maybeHookName.length + 2;
       const hookStartChar = passageText[hookStartIndex];
       if (hookStartChar === "[") {
         const hookText = getSubstringBetweenBrackets(
@@ -223,39 +306,17 @@ function extractLeftHooksAtIndex(passageText, currentIndex) {
   }
 }
 
-const tagKeys = ["speaker", "emotion"]
-const speaker_prefix = "speaker:"
-const delimiter = ":"
-const default_meta = {
-  speaker: "",
-  emotion: ""
-}
-
-// parses "ABC:XYZ" tags if valid 
-function parseMetaTags(tags) {
-  if (!tags || typeof tags !== "string") {
-    return {};
-  }
-  const raw_tags = tags.trim().split(/\\s+/);
-  let metadata = {};
-  for (const tag of raw_tags) {
-    if (!tag.includes(delimiter)) continue;
-    let [key, value] = tag.split(delimiter, 2);
-    metadata[key] = value;
-  }
-  return metadata;
-}
-
-
 function extractHooksAtIndex(passageText, currentIndex) {
   const regexAlphaNum = /[a-z0-9]+/i;
   const currentChar = passageText[currentIndex];
   const nextChar = passageText[currentIndex + 1];
   const prevChar = currentIndex && passageText[currentIndex - 1];
+
   if (currentChar === "[" && nextChar !== "[" && prevChar !== "[") {
     const hookText = getSubstringBetweenBrackets(passageText, currentIndex);
     const hookEndIndex = currentIndex + hookText.length + 2;
     const hookEndChar = passageText[hookEndIndex];
+
     if (hookEndChar === "<") {
       const maybeHookName = getSubstringBetweenBrackets(
         passageText,
@@ -275,16 +336,31 @@ function extractHooksAtIndex(passageText, currentIndex) {
         };
       }
     }
+
     const original = passageText.substring(currentIndex, hookText.length + 2);
     return { hookName: undefined, hookText: hookText, original: original };
   }
+}
+
+function parseMetaTags(tags) {
+  if (!tags || typeof tags !== "string") {
+    return {};
+  }
+  const raw_tags = tags.trim().split(/\\s+/);
+  let metadata = {};
+  for (const tag of raw_tags) {
+    if (!tag.includes(delimiter)) continue;
+    let [key, value] = tag.split(delimiter, 2);
+    metadata[key] = value;
+  }
+  return metadata;
 }
 
 function sanitizeText(passageText, links, hooks, format) {
   links.forEach((link) => {
     passageText = passageText.replace(link.original, "");
   });
-  if (format === FORMAT_HARLOWE_3) {
+  if (format === FORMAT_HARLOWE_3 && hooks) {
     hooks.forEach((hook) => {
       passageText = passageText.replace(hook.original, "");
     });
@@ -292,11 +368,10 @@ function sanitizeText(passageText, links, hooks, format) {
   return passageText.trim();
 }
 
-/**
- * Convert an HTML element to an object of attribute values.
- */
 function getElementAttributes(element) {
   const result = {};
+  if (!element || !element.attributes) return result;
+
   const attributes = Array.from(element.attributes);
   attributes.forEach((attribute) => {
     result[attribute.name] = attribute.value;
@@ -305,21 +380,17 @@ function getElementAttributes(element) {
   return result;
 }
 
-/**
- * True if string starts with the given substring.
- */
 function stringStartsWith(string, startswith) {
   return string.trim().substring(0, startswith.length) === startswith;
 }
 
-/**
- * Returns string with prefix removed
- */
 function trimPrefix(string, startswith) {
-  return string.trim().substring(startswith.length + 1, -1)
+  const trimmed = string.trim();
+  if (trimmed.startsWith(startswith)) {
+    return trimmed.slice(startswith.length).trim();
+  }
+  return trimmed;
 }
-
-
 
 function getSubstringBetweenBrackets(
   string,
@@ -332,108 +403,37 @@ function getSubstringBetweenBrackets(
   const bracketStack = [];
   let currentIndex = startIndex || 0;
   let substring = "";
+
   if (string[currentIndex] !== openBracket) {
     throw new Error(
       "startIndex of getSubstringBetweenBrackets must correspond to an open bracket",
     );
   }
+
   while (currentIndex < string.length) {
     const currentChar = string[currentIndex];
-    // pull top bracket from stack if we hit a close bracket
+
     if (currentChar === closeBracket) {
       bracketStack.pop();
     }
-    // build substring so long as stack is populated
+
     if (bracketStack.length) {
       substring += currentChar;
     }
-    // add open brackets to the top of the stack
+
     if (currentChar === openBracket) {
       bracketStack.push(currentChar);
     }
-    // return if stack is empty and substring is set
+
     if (!bracketStack.length) {
       return substring;
     }
+
     currentIndex += 1;
   }
+
   return substring;
 }
-
-
-
-function parseTrailingDirectives(passageText, startIndex) {
-  // Matches a single <!--showif: ...--> or <!--action: ...--> block per iteration
-  // Using --!?> guarantees consuming both standard '-->' and typo '--!>'
-  const directiveRegex = /^\\s*<!--(showif|action):\\s*([\\s\\S]*?)--!?>/i;
-
-  const show_if = [];
-  const actions = [];
-  let currentIndex = startIndex;
-
-  // Loop through consecutive directive comments
-  while (currentIndex < passageText.length) {
-    const remainingText = passageText.substring(currentIndex);
-    const match = remainingText.match(directiveRegex);
-    if (!match) break; // Stop as soon as no more directives follow
-
-    const directiveType = match[1].toLowerCase();
-    const payload = match[2].trim();
-
-    // Supports both single-entry lines and comma-separated entries
-    const items = payload.split(",").map(s => s.trim()).filter(Boolean);
-    for (const item of items) {
-      if (!item.includes(":")) continue;
-
-      let trimmed = item;
-      let inverse = false;
-      if (trimmed.startsWith("!")) {
-        inverse = true;
-        trimmed = trimmed.substring(1);
-      }
-
-      const [type, value] = trimmed.split(":", 2);
-      if (directiveType === "showif") {
-        let finalValue = value ? value.trim() : "";
-
-        // Canonicalize local dialogue references into "convoId.passageId"
-        const isDialogueCheck = type.toLowerCase().includes("dialog");
-        if (isDialogueCheck) {
-          finalValue = canonicalizeKey(convoId, finalValue);
-        }
-
-        show_if.push({
-          type: type.trim(),
-          value: finalValue,
-          inverse: inverse
-        });
-      } else if (directiveType === "action") {
-        actions.push({
-          type: type.trim(),
-          value: value ? value.trim() : ""
-        });
-      }
-    }
-
-    // Advance index past this entire comment block
-    currentIndex += match[0].length;
-  }
-
-  return {
-    show_if,
-    actions,
-    endIndex: currentIndex
-  };
-}
-
-
-function canonicalizeKey(convoId, key) {
-  if (!key) return "";
-  const trimmed = key.trim();
-  return trimmed.includes(".") ? trimmed : `${convoId}.${trimmed}`;
-}
-
-
         </script>
 	</head>
 	<body>
