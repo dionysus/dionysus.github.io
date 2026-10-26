@@ -1,5 +1,5 @@
 window.storyFormat({
-    "name": "BLINDSTACK JSON",
+    "name": "Harlowe 3 to JSON (blindstack)",
     "version": "0.0.1",
     "author": "dionysus",
     "description": "Convert Harlowe 3-formatted Twine story to JSON",
@@ -37,6 +37,10 @@ const FORMAT_TWINE = "twine";
 const FORMAT_HARLOWE_3 = "harlowe-3";
 const VALID_FORMATS = [FORMAT_TWINE, FORMAT_HARLOWE_3];
 
+
+
+
+
 /**
  * Convert Twine story to JSON.
  */
@@ -56,8 +60,9 @@ function twineToJSON(format) {
   const passageElements = Array.from(
     storyElement.getElementsByTagName(PASSAGE_TAG_NAME),
   );
+  const convoId = (storyMeta.name || "default").toLowerCase().trim();
   result.passages = passageElements.map((passageElement) => {
-    return processPassageElement(passageElement, format);
+    return processPassageElement(passageElement, format, convoId);
   });
   return result;
 }
@@ -76,18 +81,20 @@ function validate(format) {
 
 function processPassageElement(passageElement, format) {
   const passageMeta = getElementAttributes(passageElement);
+  const rawName = passageMeta.name.trim();
+
   const result = {
-    id: passageMeta.name,
-    // tags: passageMeta.tags,
+    id: rawName,
+    convo_key: `${convoId}.${rawName}`, // <-- Pre-baked passage composite key
     pid: passageMeta.pid,
   };
-  result.meta = parseMetaTags(passageMeta.tags);
 
+  result.meta = parseMetaTags(passageMeta.tags);
   const rawContent = passageElement.textContent || passageElement.innerText || "";
   result.text = rawContent.trim();
-  // result.text = passageElement.innerText.trim();
 
-  Object.assign(result, processPassageText(result.text, format));
+  // Pass convoId into processPassageText
+  Object.assign(result, processPassageText(result.text, format, convoId));
   result.cleanText = sanitizeText(
     result.text,
     result.links,
@@ -177,7 +184,7 @@ function extractLinksAtIndex(passageText, currentIndex) {
 
     return {
       text: text,
-      target_id: targetId,
+      target_id: canonicalizeKey(convoId, targetId),
       show_if: directives.show_if,
       actions: directives.actions,
       original: original
@@ -387,9 +394,17 @@ function parseTrailingDirectives(passageText, startIndex) {
 
       const [type, value] = trimmed.split(":", 2);
       if (directiveType === "showif") {
+        let finalValue = value ? value.trim() : "";
+
+        // Canonicalize local dialogue references into "convoId.passageId"
+        const isDialogueCheck = type.toLowerCase().includes("dialog");
+        if (isDialogueCheck) {
+          finalValue = canonicalizeKey(convoId, finalValue);
+        }
+
         show_if.push({
           type: type.trim(),
-          value: value ? value.trim() : "",
+          value: finalValue,
           inverse: inverse
         });
       } else if (directiveType === "action") {
@@ -410,6 +425,15 @@ function parseTrailingDirectives(passageText, startIndex) {
     endIndex: currentIndex
   };
 }
+
+
+function canonicalizeKey(convoId, key) {
+  if (!key) return "";
+  const trimmed = key.trim();
+  return trimmed.includes(".") ? trimmed : `${convoId}.${trimmed}`;
+}
+
+
         </script>
 	</head>
 	<body>
